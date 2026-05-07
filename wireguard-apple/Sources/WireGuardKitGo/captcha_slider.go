@@ -1,517 +1,631 @@
 package main
 
 import (
-    "bytes"
-    "encoding/base64"
-    "encoding/json"
-    "fmt"
-    "image"
-    "image/color"
-    _ "image/jpeg"
-    "log"
-    neturl "net/url"
-    "sort"
-    "strconv"
-    "strings"
-    "time"
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	_ "image/jpeg"
+	"log"
+	"math"
+	mathrand "math/rand"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 )
 
-const (
-    sliderCaptchaType     = "slider"
-    defaultSliderAttempts = 4
-)
-
-// vkReqFunc is the type for the VK API request helper from callCaptchaNotRobotAPI.
-type vkReqFunc func(method, postData string) (map[string]interface{}, error)
-
-type sliderCaptchaContent struct {
-    Image    image.Image
-    Size     int    // grid NxN
-    Steps    []int  // swap pairs
-    Attempts int    // max submit attempts
+type sliderPuzzleV2 struct {
+	Image    image.Image
+	Size     int
+	Swaps    []int
+	Attempts int
 }
 
-type sliderCandidate struct {
-    Index       int
-    ActiveSteps []int
-    Score       int64
+type sliderGuessV2 struct {
+	Index         int
+	Swaps         []int
+	Score         int64
+	ScoreRGB      int64
+	ScoreLuma     int64
+	ScoreText     float64
+	ConsensusRank int
 }
 
-// solveSliderCaptcha attempts to solve a VK slider captcha automatically.
-// It fetches the scrambled image via captchaNotRobot.getContent, analyzes
-// tile border continuity to find the correct permutation, and submits the answer.
-func solveSliderCaptcha(
-    vkReq vkReqFunc,
-    baseParams string,
-    browserFp string,
-    hash string,
-    settingsResp map[string]interface{},
+func (s *captchaV2Session) solveSliderCaptcha(
+	sessionToken string,
+	browserFP string,
+	hash string,
+	settings string,
+	debugInfo string,
 ) (string, error) {
-    // Extract slider settings from the settings response
-    sliderSettings := extractSliderSettings(settingsResp)
+	values := [][2]string{
+		{"session_token", sessionToken},
+		{"domain", "vk.com"},
+		{"adFp", ""},
+		{"access_token", ""},
+		{"captcha_settings", settings},
+	}
 
-    log.Printf("slider: fetching captcha content (settings=%q)", sliderSettings)
+	resp, err := s.captchaRequest("captchaNotRobot.getContent", values)
+	if err != nil {
+		return "", fmt.Errorf("slider getContent failed: %w", err)
+	}
+	puzzle, err := parseSliderPuzzleV2(resp)
+	if err != nil {
+		return "", err
+	}
+	log.Printf("v2 slider puzzle decoded: grid=%d attempts=%d swaps=%d", puzzle.Size, puzzle.Attempts, len(puzzle.Swaps))
 
-    // Get scrambled image and swap instructions
-    getContentData := baseParams
-    if sliderSettings != "" {
-        getContentData += "&captcha_settings=" + neturl.QueryEscape(sliderSettings)
-    }
+	guesses, err := rankSliderGuessesV2(puzzle.Image, puzzle.Size, puzzle.Swaps)
+	if err != nil {
+		return "", err
+	}
 
-    resp, err := vkReq("captchaNotRobot.getContent", getContentData)
-    if err != nil {
-        return "", fmt.Errorf("slider getContent: %w", err)
-    }
+	limit := puzzle.Attempts
+	if limit > len(guesses) {
+		limit = len(guesses)
+	}
+	if limit <= 0 {
+		return "", errors.New("slider has no attempts available")
+	}
+	log.Printf("v2 slider guesses ranked: total=%d limit=%d", len(guesses), limit)
 
-    content, err := parseSliderContent(resp)
-    if err != nil {
-        return "", fmt.Errorf("slider parse: %w", err)
-    }
+	deviceJSON := captchaV2DeviceInfo
+	if s.savedProfile != nil && strings.TrimSpace(s.savedProfile.DeviceJSON) != "" {
+		deviceJSON = s.savedProfile.DeviceJSON
+	}
+	if _, err := s.captchaRequest("captchaNotRobot.componentDone", [][2]string{
+		{"session_token", sessionToken},
+		{"domain", "vk.com"},
+		{"adFp", ""},
+		{"access_token", ""},
+		{"browser_fp", browserFP},
+		{"device", deviceJSON},
+	}); err != nil {
+		return "", fmt.Errorf("captcha componentDone failed: %w", err)
+	}
 
-    log.Printf("slider: image=%dx%d grid=%d steps=%d attempts=%d",
-        content.Image.Bounds().Dx(), content.Image.Bounds().Dy(),
-        content.Size, len(content.Steps)/2, content.Attempts)
-
-    // Rank candidate positions by pixel border continuity
-    candidates, err := rankSliderCandidates(content.Image, content.Size, content.Steps)
-    if err != nil {
-        return "", fmt.Errorf("slider rank: %w", err)
-    }
-
-    maxTries := content.Attempts
-    if maxTries > len(candidates) {
-        maxTries = len(candidates)
-    }
-
-    log.Printf("slider: ranked %d positions, trying top %d", len(candidates), maxTries)
-
-    // Try each candidate
-    for i := 0; i < maxTries; i++ {
-        c := candidates[i]
-        log.Printf("slider: guess %d/%d position=%d score=%d", i+1, maxTries, c.Index, c.Score)
-
-        answer, err := encodeSliderAnswer(c.ActiveSteps)
-        if err != nil {
-            return "", err
-        }
-
-        // Generate slider cursor (simulates drag from left to position)
-        cursor := generateSliderCursor(c.Index, len(candidates))
-
-        checkData := baseParams + fmt.Sprintf(
-            "&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
-                "&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
-            neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
-            neturl.QueryEscape(cursor),
-            neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
-            browserFp, hash, neturl.QueryEscape(answer),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        )
-
-        checkResp, err := vkReq("captchaNotRobot.check", checkData)
-        if err != nil {
-            return "", fmt.Errorf("slider check: %w", err)
-        }
-
-        respObj, ok := checkResp["response"].(map[string]interface{})
-        if !ok {
-            return "", fmt.Errorf("slider check: invalid response")
-        }
-
-        status, _ := respObj["status"].(string)
-        switch status {
-        case "OK":
-            successToken, _ := respObj["success_token"].(string)
-            if successToken == "" {
-                return "", fmt.Errorf("slider: success_token not found")
-            }
-            log.Printf("slider: solved! position=%d (attempt %d/%d)", c.Index, i+1, maxTries)
-            return successToken, nil
-        case "ERROR_LIMIT":
-            return "", fmt.Errorf("slider: ERROR_LIMIT")
-        default:
-            log.Printf("slider: position=%d rejected (status=%s)", c.Index, status)
-            time.Sleep(500 * time.Millisecond)
-        }
-    }
-
-    return "", fmt.Errorf("slider: all %d guesses rejected", maxTries)
+	for i := 0; i < limit; i++ {
+		log.Printf("v2 slider attempt %d/%d (guess #%d)", i+1, limit, guesses[i].Index)
+		answerData, err := json.Marshal(struct {
+			Value []int `json:"value"`
+		}{Value: guesses[i].Swaps})
+		if err != nil {
+			return "", err
+		}
+		check, err := s.performCaptchaCheck(
+			sessionToken,
+			browserFP,
+			hash,
+			string(answerData),
+			buildSliderCursorV2(guesses[i].Index, len(guesses)),
+			debugInfo,
+		)
+		if err != nil {
+			return "", err
+		}
+		if strings.EqualFold(check.Status, "ok") {
+			if check.SuccessToken == "" {
+				return "", errors.New("captcha success token not found")
+			}
+			log.Printf("v2 slider accepted on attempt %d", i+1)
+			return check.SuccessToken, nil
+		}
+		if strings.EqualFold(check.Status, "error_limit") {
+			return "", errCaptchaV2RateLimit
+		}
+	}
+	return "", errors.New("slider guesses exhausted")
 }
 
-// extractSliderSettings extracts slider captcha_settings from settings API response.
-func extractSliderSettings(settingsResp map[string]interface{}) string {
-    if settingsResp == nil {
-        return ""
-    }
-    respObj, ok := settingsResp["response"].(map[string]interface{})
-    if !ok {
-        return ""
-    }
-
-    // Try to find captcha_settings for slider type
-    raw := respObj["captcha_settings"]
-    if raw == nil {
-        return ""
-    }
-
-    // captcha_settings can be array or map
-    switch v := raw.(type) {
-    case []interface{}:
-        for _, item := range v {
-            m, ok := item.(map[string]interface{})
-            if !ok {
-                continue
-            }
-            t, _ := m["type"].(string)
-            if t == sliderCaptchaType {
-                return normalizeSettings(m["settings"])
-            }
-        }
-    case map[string]interface{}:
-        if s, ok := v[sliderCaptchaType]; ok {
-            return normalizeSettings(s)
-        }
-    case string:
-        // Try JSON parse
-        trimmed := strings.TrimSpace(v)
-        if trimmed == "" {
-            return ""
-        }
-        var items []interface{}
-        if err := json.Unmarshal([]byte(trimmed), &items); err == nil {
-            return extractSliderSettings(map[string]interface{}{
-                "response": map[string]interface{}{"captcha_settings": items},
-            })
-        }
-    }
-    return ""
+func parseSliderPuzzleV2(raw map[string]any) (*sliderPuzzleV2, error) {
+	resp, ok := raw["response"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid slider content response: %v", raw)
+	}
+	status := captchaV2StringifyAny(resp["status"])
+	if !strings.EqualFold(status, "ok") {
+		return nil, fmt.Errorf("slider getContent status: %s", status)
+	}
+	rawImage := captchaV2StringifyAny(resp["image"])
+	if rawImage == "" {
+		return nil, errors.New("slider image missing")
+	}
+	rawSteps, ok := resp["steps"].([]any)
+	if !ok {
+		return nil, errors.New("slider steps missing")
+	}
+	steps := make([]int, 0, len(rawSteps))
+	for _, item := range rawSteps {
+		switch v := item.(type) {
+		case float64:
+			steps = append(steps, int(v))
+		case int:
+			steps = append(steps, v)
+		case string:
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				return nil, fmt.Errorf("invalid numeric value: %v", item)
+			}
+			steps = append(steps, n)
+		default:
+			return nil, fmt.Errorf("invalid numeric value: %v", item)
+		}
+	}
+	size, swaps, attempts, err := splitSliderStepsV2(steps)
+	if err != nil {
+		return nil, err
+	}
+	data, err := base64.StdEncoding.DecodeString(rawImage)
+	if err != nil {
+		return nil, fmt.Errorf("decode slider image: %w", err)
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("decode slider image: %w", err)
+	}
+	return &sliderPuzzleV2{Image: img, Size: size, Swaps: swaps, Attempts: attempts}, nil
 }
 
-func normalizeSettings(raw interface{}) string {
-    switch v := raw.(type) {
-    case nil:
-        return ""
-    case string:
-        return v
-    default:
-        data, err := json.Marshal(v)
-        if err != nil {
-            return ""
-        }
-        return string(data)
-    }
+func splitSliderStepsV2(steps []int) (int, []int, int, error) {
+	if len(steps) < 3 {
+		return 0, nil, 0, errors.New("slider steps payload too short")
+	}
+	size := steps[0]
+	if size <= 0 {
+		return 0, nil, 0, fmt.Errorf("invalid slider size: %d", size)
+	}
+	tail := append([]int(nil), steps[1:]...)
+	attempts := 4
+	if len(tail)%2 != 0 {
+		attempts = tail[len(tail)-1]
+		tail = tail[:len(tail)-1]
+		log.Printf("v2 slider payload had odd-length tail; fallback attempts=%d", attempts)
+	}
+	if attempts <= 0 {
+		attempts = 4
+	}
+	if len(tail) == 0 || len(tail)%2 != 0 {
+		return 0, nil, 0, errors.New("invalid slider swap payload")
+	}
+	return size, tail, attempts, nil
 }
 
-// parseSliderContent parses the getContent API response.
-func parseSliderContent(resp map[string]interface{}) (*sliderCaptchaContent, error) {
-    respObj, ok := resp["response"].(map[string]interface{})
-    if !ok {
-        return nil, fmt.Errorf("invalid response: %v", resp)
-    }
+func rankSliderGuessesV2(img image.Image, gridSize int, swaps []int) ([]sliderGuessV2, error) {
+	candidateCount := len(swaps) / 2
+	if candidateCount == 0 {
+		return nil, errors.New("slider has no candidates")
+	}
 
-    status, _ := respObj["status"].(string)
-    if status != "OK" {
-        return nil, fmt.Errorf("status: %s", status)
-    }
+	guesses := make([]sliderGuessV2, candidateCount)
+	for idx := 1; idx <= candidateCount; idx++ {
+		active := activeSwapsForIndexV2(swaps, idx)
+		mapping, err := applySliderSwapsV2(gridSize, active)
+		if err != nil {
+			return nil, err
+		}
+		guesses[idx-1] = sliderGuessV2{Index: idx, Swaps: active}
+		guesses[idx-1].ScoreLuma = seamScoreLumaV2(img, gridSize, mapping)
+	}
 
-    ext, _ := respObj["extension"].(string)
-    ext = strings.ToLower(ext)
-    if ext != "jpeg" && ext != "jpg" {
-        return nil, fmt.Errorf("unsupported image format: %s", ext)
-    }
+	lumaOrder := append([]sliderGuessV2(nil), guesses...)
+	sort.SliceStable(lumaOrder, func(i, j int) bool {
+		if lumaOrder[i].ScoreLuma == lumaOrder[j].ScoreLuma {
+			return lumaOrder[i].Index < lumaOrder[j].Index
+		}
+		return lumaOrder[i].ScoreLuma < lumaOrder[j].ScoreLuma
+	})
+	lumaRank := make(map[int]int, candidateCount)
+	for rank, g := range lumaOrder {
+		lumaRank[g.Index] = rank
+	}
 
-    rawImage, _ := respObj["image"].(string)
-    if rawImage == "" {
-        return nil, fmt.Errorf("image missing")
-    }
+	stage2Count := candidateCount
+	if stage2Count > 12 {
+		stage2Count = 12
+	}
+	stage2Set := make(map[int]struct{}, stage2Count)
+	for i := 0; i < stage2Count; i++ {
+		stage2Set[lumaOrder[i].Index] = struct{}{}
+	}
 
-    rawSteps, ok := respObj["steps"].([]interface{})
-    if !ok {
-        return nil, fmt.Errorf("steps missing")
-    }
+	type stage2Result struct {
+		index int
+		rgb   int64
+		text  float64
+		err   error
+	}
+	jobs := make([]int, 0, stage2Count)
+	for idx := range stage2Set {
+		jobs = append(jobs, idx)
+	}
+	jobCh := make(chan int, len(jobs))
+	resCh := make(chan stage2Result, len(jobs))
 
-    steps, err := parseIntSlice(rawSteps)
-    if err != nil {
-        return nil, err
-    }
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(jobs) {
+		workers = len(jobs)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobCh {
+				mapping, err := applySliderSwapsV2(gridSize, guesses[index-1].Swaps)
+				if err != nil {
+					resCh <- stage2Result{index: index, err: err}
+					continue
+				}
+				rgb, text := seamScoreRGBTextV2(img, gridSize, mapping)
+				resCh <- stage2Result{index: index, rgb: rgb, text: text}
+			}
+		}()
+	}
+	for _, idx := range jobs {
+		jobCh <- idx
+	}
+	close(jobCh)
+	wg.Wait()
+	close(resCh)
+	for r := range resCh {
+		if r.err != nil {
+			return nil, r.err
+		}
+		g := &guesses[r.index-1]
+		g.ScoreRGB = r.rgb
+		g.ScoreText = r.text
+	}
 
-    size, swaps, attempts, err := parseSliderSteps(steps)
-    if err != nil {
-        return nil, err
-    }
+	stage2 := make([]sliderGuessV2, 0, stage2Count)
+	for _, g := range guesses {
+		if _, ok := stage2Set[g.Index]; ok {
+			stage2 = append(stage2, g)
+		}
+	}
 
-    img, err := decodeSliderImage(rawImage)
-    if err != nil {
-        return nil, err
-    }
+	rgbOrder := append([]sliderGuessV2(nil), stage2...)
+	sort.SliceStable(rgbOrder, func(i, j int) bool {
+		if rgbOrder[i].ScoreRGB == rgbOrder[j].ScoreRGB {
+			return rgbOrder[i].Index < rgbOrder[j].Index
+		}
+		return rgbOrder[i].ScoreRGB < rgbOrder[j].ScoreRGB
+	})
+	rgbRank := make(map[int]int, len(rgbOrder))
+	for rank, g := range rgbOrder {
+		rgbRank[g.Index] = rank
+	}
 
-    return &sliderCaptchaContent{
-        Image:    img,
-        Size:     size,
-        Steps:    swaps,
-        Attempts: attempts,
-    }, nil
+	textOrder := append([]sliderGuessV2(nil), stage2...)
+	sort.SliceStable(textOrder, func(i, j int) bool {
+		if textOrder[i].ScoreText == textOrder[j].ScoreText {
+			return textOrder[i].Index < textOrder[j].Index
+		}
+		return textOrder[i].ScoreText < textOrder[j].ScoreText
+	})
+	textRank := make(map[int]int, len(textOrder))
+	for rank, g := range textOrder {
+		textRank[g.Index] = rank
+	}
+
+	for i := range guesses {
+		g := &guesses[i]
+		g.ConsensusRank = lumaRank[g.Index]
+		if _, ok := stage2Set[g.Index]; ok {
+			g.ConsensusRank += rgbRank[g.Index] + textRank[g.Index]
+		} else {
+			g.ConsensusRank += candidateCount
+		}
+		g.Score = int64(g.ConsensusRank)
+	}
+
+	sort.SliceStable(guesses, func(i, j int) bool {
+		if guesses[i].ConsensusRank == guesses[j].ConsensusRank {
+			if guesses[i].ScoreLuma == guesses[j].ScoreLuma {
+				return guesses[i].Index < guesses[j].Index
+			}
+			return guesses[i].ScoreLuma < guesses[j].ScoreLuma
+		}
+		return guesses[i].ConsensusRank < guesses[j].ConsensusRank
+	})
+	return guesses, nil
 }
 
-func parseIntSlice(raw []interface{}) ([]int, error) {
-    values := make([]int, 0, len(raw))
-    for _, item := range raw {
-        switch v := item.(type) {
-        case float64:
-            values = append(values, int(v))
-        case int:
-            values = append(values, v)
-        case string:
-            n, err := strconv.Atoi(strings.TrimSpace(v))
-            if err != nil {
-                return nil, fmt.Errorf("invalid numeric: %v", item)
-            }
-            values = append(values, n)
-        default:
-            return nil, fmt.Errorf("invalid numeric: %v", item)
-        }
-    }
-    return values, nil
+func activeSwapsForIndexV2(swaps []int, index int) []int {
+	if index <= 0 {
+		return []int{}
+	}
+	end := index * 2
+	if end > len(swaps) {
+		end = len(swaps)
+	}
+	return append([]int(nil), swaps[:end]...)
 }
 
-func parseSliderSteps(steps []int) (int, []int, int, error) {
-    if len(steps) < 3 {
-        return 0, nil, 0, fmt.Errorf("steps too short: %d", len(steps))
-    }
-
-    size := steps[0]
-    if size <= 0 {
-        return 0, nil, 0, fmt.Errorf("invalid grid size: %d", size)
-    }
-
-    remaining := append([]int(nil), steps[1:]...)
-    attempts := defaultSliderAttempts
-    if len(remaining)%2 != 0 {
-        attempts = remaining[len(remaining)-1]
-        remaining = remaining[:len(remaining)-1]
-    }
-    if attempts <= 0 {
-        attempts = defaultSliderAttempts
-    }
-    if len(remaining) == 0 || len(remaining)%2 != 0 {
-        return 0, nil, 0, fmt.Errorf("invalid swap payload")
-    }
-
-    return size, remaining, attempts, nil
+func applySliderSwapsV2(gridSize int, swaps []int) ([]int, error) {
+	tileCount := gridSize * gridSize
+	if tileCount <= 0 {
+		return nil, fmt.Errorf("invalid slider tile count: %d", tileCount)
+	}
+	if len(swaps)%2 != 0 {
+		return nil, fmt.Errorf("invalid slider swaps length: %d", len(swaps))
+	}
+	mapping := make([]int, tileCount)
+	for i := range mapping {
+		mapping[i] = i
+	}
+	for i := 0; i < len(swaps); i += 2 {
+		left := swaps[i]
+		right := swaps[i+1]
+		if left < 0 || right < 0 || left >= tileCount || right >= tileCount {
+			return nil, fmt.Errorf("slider step out of range: %d,%d", left, right)
+		}
+		mapping[left], mapping[right] = mapping[right], mapping[left]
+	}
+	return mapping, nil
 }
 
-func decodeSliderImage(rawImage string) (image.Image, error) {
-    decoded, err := base64.StdEncoding.DecodeString(rawImage)
-    if err != nil {
-        return nil, fmt.Errorf("base64 decode: %w", err)
-    }
-    img, _, err := image.Decode(bytes.NewReader(decoded))
-    if err != nil {
-        return nil, fmt.Errorf("image decode: %w", err)
-    }
-    return img, nil
+func seamScoreLumaV2(img image.Image, gridSize int, mapping []int) int64 {
+	bounds := img.Bounds()
+	var score int64
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			leftIdx := row*gridSize + col
+			rightIdx := leftIdx + 1
+			leftDst := sliderTileRect(bounds, gridSize, leftIdx)
+			rightDst := sliderTileRect(bounds, gridSize, rightIdx)
+			leftSrc := sliderTileRect(bounds, gridSize, mapping[leftIdx])
+			rightSrc := sliderTileRect(bounds, gridSize, mapping[rightIdx])
+			h := leftDst.Dy()
+			if rightDst.Dy() < h {
+				h = rightDst.Dy()
+			}
+			for y := 0; y < h; y++ {
+				yy := leftDst.Min.Y + y
+				a := sampleLumaMappedV2(img, leftDst, leftSrc, leftDst.Max.X-1, yy)
+				b := sampleLumaMappedV2(img, rightDst, rightSrc, rightDst.Min.X, yy)
+				score += int64(absIntV2(int(a) - int(b)))
+			}
+		}
+	}
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			topIdx := row*gridSize + col
+			bottomIdx := (row+1)*gridSize + col
+			topDst := sliderTileRect(bounds, gridSize, topIdx)
+			bottomDst := sliderTileRect(bounds, gridSize, bottomIdx)
+			topSrc := sliderTileRect(bounds, gridSize, mapping[topIdx])
+			bottomSrc := sliderTileRect(bounds, gridSize, mapping[bottomIdx])
+			w := topDst.Dx()
+			if bottomDst.Dx() < w {
+				w = bottomDst.Dx()
+			}
+			for x := 0; x < w; x++ {
+				xx := topDst.Min.X + x
+				a := sampleLumaMappedV2(img, topDst, topSrc, xx, topDst.Max.Y-1)
+				b := sampleLumaMappedV2(img, bottomDst, bottomSrc, xx, bottomDst.Min.Y)
+				score += int64(absIntV2(int(a) - int(b)))
+			}
+		}
+	}
+	return score
 }
 
-func encodeSliderAnswer(activeSteps []int) (string, error) {
-    payload := struct {
-        Value []int `json:"value"`
-    }{Value: activeSteps}
-    data, err := json.Marshal(payload)
-    if err != nil {
-        return "", err
-    }
-    return base64.StdEncoding.EncodeToString(data), nil
+func seamScoreRGBTextV2(img image.Image, gridSize int, mapping []int) (int64, float64) {
+	bounds := img.Bounds()
+	height := float64(bounds.Dy())
+	textCenters := []float64{
+		float64(bounds.Min.Y) + 0.2*height,
+		float64(bounds.Min.Y) + 0.5*height,
+		float64(bounds.Min.Y) + 0.8*height,
+	}
+	sigma := height * 0.14
+	if sigma < 1.0 {
+		sigma = 1.0
+	}
+	weight := func(y int) float64 {
+		yf := float64(y)
+		best := absFloatV2(yf - textCenters[0])
+		for i := 1; i < len(textCenters); i++ {
+			d := absFloatV2(yf - textCenters[i])
+			if d < best {
+				best = d
+			}
+		}
+		return 1 + 3*math.Exp(-(best*best)/(2*sigma*sigma))
+	}
+
+	var rgbScore int64
+	var textScore float64
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			leftIdx := row*gridSize + col
+			rightIdx := leftIdx + 1
+			leftDst := sliderTileRect(bounds, gridSize, leftIdx)
+			rightDst := sliderTileRect(bounds, gridSize, rightIdx)
+			leftSrc := sliderTileRect(bounds, gridSize, mapping[leftIdx])
+			rightSrc := sliderTileRect(bounds, gridSize, mapping[rightIdx])
+			h := leftDst.Dy()
+			if rightDst.Dy() < h {
+				h = rightDst.Dy()
+			}
+			for y := 0; y < h; y++ {
+				yy := leftDst.Min.Y + y
+				l := sampleColorMappedV2(img, leftDst, leftSrc, leftDst.Max.X-1, yy)
+				r := sampleColorMappedV2(img, rightDst, rightSrc, rightDst.Min.X, yy)
+				rgbScore += pixelDiff(l, r)
+				_, _, lb, _ := l.RGBA()
+				_, _, rb, _ := r.RGBA()
+				textScore += weight(yy) * float64(absIntV2(int(lb>>8)-int(rb>>8)))
+			}
+		}
+	}
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			topIdx := row*gridSize + col
+			bottomIdx := (row+1)*gridSize + col
+			topDst := sliderTileRect(bounds, gridSize, topIdx)
+			bottomDst := sliderTileRect(bounds, gridSize, bottomIdx)
+			topSrc := sliderTileRect(bounds, gridSize, mapping[topIdx])
+			bottomSrc := sliderTileRect(bounds, gridSize, mapping[bottomIdx])
+			w := topDst.Dx()
+			if bottomDst.Dx() < w {
+				w = bottomDst.Dx()
+			}
+			for x := 0; x < w; x++ {
+				xx := topDst.Min.X + x
+				t := sampleColorMappedV2(img, topDst, topSrc, xx, topDst.Max.Y-1)
+				b := sampleColorMappedV2(img, bottomDst, bottomSrc, xx, bottomDst.Min.Y)
+				rgbScore += pixelDiff(t, b)
+				_, _, tb, _ := t.RGBA()
+				_, _, bb, _ := b.RGBA()
+				textScore += 0.65 * float64(absIntV2(int(tb>>8)-int(bb>>8)))
+			}
+		}
+	}
+	return rgbScore, textScore
 }
 
-// rankSliderCandidates analyzes each candidate permutation and ranks by
-// pixel border continuity (lower score = better match = more likely correct).
-func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderCandidate, error) {
-    candidateCount := len(swaps) / 2
-    if candidateCount == 0 {
-        return nil, fmt.Errorf("no candidates")
-    }
-
-    candidates := make([]sliderCandidate, 0, candidateCount)
-    for idx := 1; idx <= candidateCount; idx++ {
-        activeSteps := buildSliderActiveSteps(swaps, idx)
-        mapping, err := buildSliderTileMapping(gridSize, activeSteps)
-        if err != nil {
-            return nil, err
-        }
-
-        rendered, err := renderSliderCandidate(img, gridSize, mapping)
-        if err != nil {
-            return nil, err
-        }
-
-        score := scoreRenderedSliderImage(rendered, gridSize)
-        candidates = append(candidates, sliderCandidate{
-            Index:       idx,
-            ActiveSteps: activeSteps,
-            Score:       score,
-        })
-    }
-
-    sort.SliceStable(candidates, func(i, j int) bool {
-        if candidates[i].Score == candidates[j].Score {
-            return candidates[i].Index < candidates[j].Index
-        }
-        return candidates[i].Score < candidates[j].Score
-    })
-
-    return candidates, nil
+func sampleColorMappedV2(img image.Image, dstRect image.Rectangle, srcRect image.Rectangle, dstX int, dstY int) color.Color {
+	dx := dstRect.Dx()
+	if dx < 1 {
+		dx = 1
+	}
+	dy := dstRect.Dy()
+	if dy < 1 {
+		dy = 1
+	}
+	sx := srcRect.Min.X + (dstX-dstRect.Min.X)*srcRect.Dx()/dx
+	sy := srcRect.Min.Y + (dstY-dstRect.Min.Y)*srcRect.Dy()/dy
+	return img.At(sx, sy)
 }
 
-func buildSliderActiveSteps(swaps []int, candidateIndex int) []int {
-    if candidateIndex <= 0 {
-        return []int{}
-    }
-    end := candidateIndex * 2
-    if end > len(swaps) {
-        end = len(swaps)
-    }
-    return append([]int(nil), swaps[:end]...)
+func sampleLumaMappedV2(img image.Image, dstRect image.Rectangle, srcRect image.Rectangle, dstX int, dstY int) uint8 {
+	c := sampleColorMappedV2(img, dstRect, srcRect, dstX, dstY)
+	r, g, b, _ := c.RGBA()
+	y := (299*(r>>8) + 587*(g>>8) + 114*(b>>8)) / 1000
+	return uint8(y)
 }
 
-func buildSliderTileMapping(gridSize int, activeSteps []int) ([]int, error) {
-    tileCount := gridSize * gridSize
-    if tileCount <= 0 {
-        return nil, fmt.Errorf("invalid tile count")
-    }
-    if len(activeSteps)%2 != 0 {
-        return nil, fmt.Errorf("invalid steps length: %d", len(activeSteps))
-    }
-
-    mapping := make([]int, tileCount)
-    for i := range mapping {
-        mapping[i] = i
-    }
-    for idx := 0; idx < len(activeSteps); idx += 2 {
-        l, r := activeSteps[idx], activeSteps[idx+1]
-        if l < 0 || r < 0 || l >= tileCount || r >= tileCount {
-            return nil, fmt.Errorf("step out of range: %d,%d", l, r)
-        }
-        mapping[l], mapping[r] = mapping[r], mapping[l]
-    }
-    return mapping, nil
+func absFloatV2(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
-func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image.RGBA, error) {
-    tileCount := gridSize * gridSize
-    if len(mapping) != tileCount {
-        return nil, fmt.Errorf("mapping length %d != %d", len(mapping), tileCount)
-    }
-
-    bounds := img.Bounds()
-    rendered := image.NewRGBA(bounds)
-    for dstIdx, srcIdx := range mapping {
-        srcRect := sliderTileRect(bounds, gridSize, srcIdx)
-        dstRect := sliderTileRect(bounds, gridSize, dstIdx)
-        copyTile(rendered, dstRect, img, srcRect)
-    }
-    return rendered, nil
+func absIntV2(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
-func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
-    bounds := img.Bounds()
-    var score int64
+func buildSliderCursorV2(candidateIndex int, candidateCount int) string {
+	if candidateCount <= 0 {
+		return "[]"
+	}
+	if candidateIndex < 1 {
+		candidateIndex = 1
+	}
+	if candidateIndex > candidateCount {
+		candidateIndex = candidateCount
+	}
 
-    // Horizontal borders (left tile right edge vs right tile left edge)
-    for row := 0; row < gridSize; row++ {
-        for col := 0; col < gridSize-1; col++ {
-            leftRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-            rightRect := sliderTileRect(bounds, gridSize, row*gridSize+col+1)
-            height := leftRect.Dy()
-            if h := rightRect.Dy(); h < height {
-                height = h
-            }
-            for y := 0; y < height; y++ {
-                score += pixelDiff(
-                    img.At(leftRect.Max.X-1, leftRect.Min.Y+y),
-                    img.At(rightRect.Min.X, rightRect.Min.Y+y),
-                )
-            }
-        }
-    }
+	type cursorPoint struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+	}
 
-    // Vertical borders (top tile bottom edge vs bottom tile top edge)
-    for row := 0; row < gridSize-1; row++ {
-        for col := 0; col < gridSize; col++ {
-            topRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-            bottomRect := sliderTileRect(bounds, gridSize, (row+1)*gridSize+col)
-            width := topRect.Dx()
-            if w := bottomRect.Dx(); w < width {
-                width = w
-            }
-            for x := 0; x < width; x++ {
-                score += pixelDiff(
-                    img.At(topRect.Min.X+x, topRect.Max.Y-1),
-                    img.At(bottomRect.Min.X+x, bottomRect.Min.Y),
-                )
-            }
-        }
-    }
+	startX := 570 + mathrand.Intn(40)
+	startY := 875 + mathrand.Intn(30)
 
-    return score
+	denom := candidateCount - 1
+	if denom < 1 {
+		denom = 1
+	}
+	baseTargetX := 734 + (937-734)*(candidateIndex-1)/denom
+	targetX := baseTargetX + mathrand.Intn(10) - 5
+	targetY := 655 + mathrand.Intn(14)
+
+	points := make([]cursorPoint, 0, 28)
+
+	for i := 0; i < 1+mathrand.Intn(3); i++ {
+		points = append(points, cursorPoint{
+			X: startX + mathrand.Intn(5) - 2,
+			Y: startY + mathrand.Intn(5) - 2,
+		})
+	}
+
+	transitSteps := 2 + mathrand.Intn(3)
+	arcOffX := mathrand.Intn(60) - 30
+	arcOffY := -(mathrand.Intn(30) + 10)
+	for i := 1; i <= transitSteps; i++ {
+		t := float64(i) / float64(transitSteps+1)
+		cx := float64(startX+targetX)/2 + float64(arcOffX)
+		cy := float64(startY+targetY)/2 + float64(arcOffY)
+		bx := (1-t)*(1-t)*float64(startX) + 2*t*(1-t)*cx + t*t*float64(targetX)
+		by := (1-t)*(1-t)*float64(startY) + 2*t*(1-t)*cy + t*t*float64(targetY)
+		jitter := int((1-t)*8) + 2
+		points = append(points, cursorPoint{
+			X: int(math.Round(bx)) + mathrand.Intn(jitter*2+1) - jitter,
+			Y: int(math.Round(by)) + mathrand.Intn(jitter*2+1) - jitter,
+		})
+	}
+
+	approachSteps := 4 + mathrand.Intn(4)
+	prev := points[len(points)-1]
+	for i := 1; i <= approachSteps; i++ {
+		t := float64(i) / float64(approachSteps)
+		ax := prev.X + int(math.Round(t*float64(targetX-prev.X))) + mathrand.Intn(5) - 2
+		ay := prev.Y + int(math.Round(t*float64(targetY-prev.Y))) + mathrand.Intn(5) - 2
+		points = append(points, cursorPoint{X: ax, Y: ay})
+	}
+
+	settleCount := 3 + mathrand.Intn(5)
+	for i := 0; i < settleCount; i++ {
+		points = append(points, cursorPoint{
+			X: targetX + mathrand.Intn(7) - 3,
+			Y: targetY + mathrand.Intn(7) - 3,
+		})
+	}
+
+	data, err := json.Marshal(points)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
 }
 
-func sliderTileRect(bounds image.Rectangle, gridSize, index int) image.Rectangle {
-    row := index / gridSize
-    col := index % gridSize
-    x0 := bounds.Min.X + col*bounds.Dx()/gridSize
-    x1 := bounds.Min.X + (col+1)*bounds.Dx()/gridSize
-    y0 := bounds.Min.Y + row*bounds.Dy()/gridSize
-    y1 := bounds.Min.Y + (row+1)*bounds.Dy()/gridSize
-    return image.Rect(x0, y0, x1, y1)
+// Shared helpers used by both v1 and v2 slider solvers.
+
+func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Rectangle {
+	row := index / gridSize
+	col := index % gridSize
+	x0 := bounds.Min.X + col*bounds.Dx()/gridSize
+	x1 := bounds.Min.X + (col+1)*bounds.Dx()/gridSize
+	y0 := bounds.Min.Y + row*bounds.Dy()/gridSize
+	y1 := bounds.Min.Y + (row+1)*bounds.Dy()/gridSize
+	return image.Rect(x0, y0, x1, y1)
 }
 
-func copyTile(dst *image.RGBA, dstRect image.Rectangle, src image.Image, srcRect image.Rectangle) {
-    dw, dh := dstRect.Dx(), dstRect.Dy()
-    sw, sh := srcRect.Dx(), srcRect.Dy()
-    for y := 0; y < dh; y++ {
-        sy := srcRect.Min.Y + y*sh/dh
-        for x := 0; x < dw; x++ {
-            sx := srcRect.Min.X + x*sw/dw
-            dst.Set(dstRect.Min.X+x, dstRect.Min.Y+y, src.At(sx, sy))
-        }
-    }
+func pixelDiff(left color.Color, right color.Color) int64 {
+	lr, lg, lb, _ := left.RGBA()
+	rr, rg, rb, _ := right.RGBA()
+	return absDiff(lr, rr) + absDiff(lg, rg) + absDiff(lb, rb)
 }
 
-func pixelDiff(a, b color.Color) int64 {
-    ar, ag, ab, _ := a.RGBA()
-    br, bg, bb, _ := b.RGBA()
-    return absDiff(ar, br) + absDiff(ag, bg) + absDiff(ab, bb)
-}
-
-func absDiff(a, b uint32) int64 {
-    if a > b {
-        return int64(a - b)
-    }
-    return int64(b - a)
-}
-
-func generateSliderCursor(candidateIndex, candidateCount int) string {
-    if candidateCount <= 0 {
-        return "[]"
-    }
-    type point struct {
-        X int   `json:"x"`
-        Y int   `json:"y"`
-        T int64 `json:"t"`
-    }
-    startX := 140
-    endX := startX + 620*candidateIndex/candidateCount
-    startY := 430
-    startTime := time.Now().Add(-220 * time.Millisecond).UnixMilli()
-
-    points := make([]point, 12)
-    for i := 0; i < 12; i++ {
-        points[i] = point{
-            X: startX + (endX-startX)*i/11,
-            Y: startY + (i%3 - 1),
-            T: startTime + int64(i*18),
-        }
-    }
-    data, _ := json.Marshal(points)
-    return string(data)
+func absDiff(left uint32, right uint32) int64 {
+	if left > right {
+		return int64(left - right)
+	}
+	return int64(right - left)
 }
